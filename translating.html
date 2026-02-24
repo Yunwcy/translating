@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 同步口譯逐字稿 (連續輸出版)</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #2c3e50; color: #ecf0f1; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        .container { max-width: 900px; width: 100%; background: #34495e; padding: 25px; border-radius: 12px; box-shadow: 0 8px 15px rgba(0,0,0,0.3); }
+        h2 { text-align: center; margin-top: 0; color: #1abc9c; }
+        .controls { display: flex; gap: 15px; margin-bottom: 25px; justify-content: center; align-items: center; }
+        select { padding: 8px; border-radius: 5px; border: none; outline: none; background: #ecf0f1; }
+        button { padding: 10px 25px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px; transition: 0.2s; }
+        #startBtn { background: #27ae60; color: white; }
+        #startBtn:hover { background: #2ecc71; }
+        #stopBtn { background: #c0392b; color: white; }
+        #stopBtn:disabled { background: #7f8c8d; cursor: not-allowed; }
+        #clearBtn { background: #2980b9; color: white; }
+        #clearBtn:hover { background: #3498db; }
+        
+        .display-area { display: flex; flex-direction: column; gap: 20px; }
+        .track { background: #1a252f; padding: 20px; border-radius: 8px; min-height: 200px; max-height: 400px; overflow-y: auto; }
+        .label { font-size: 14px; color: #bdc3c7; margin-bottom: 10px; border-bottom: 1px solid #7f8c8d; padding-bottom: 5px; }
+        
+        .final-text { color: #ecf0f1; line-height: 1.6; }
+        .interim-text { color: #f1c40f; font-style: italic; } /* 正在說的話用黃色斜體顯示 */
+        .status { text-align: center; margin-top: 15px; font-size: 14px; color: #95a5a6; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>⚡ AI 同步口譯逐字稿</h2>
+    
+    <div class="controls">
+        <select id="sourceLang">
+            <option value="zh-TW">中文 (台灣)</option>
+            <option value="en-US">英文 (美國)</option>
+            <option value="ja-JP">日文</option>
+        </select>
+        <span> ➔ </span>
+        <select id="targetLang">
+            <option value="en">英文</option>
+            <option value="zh-TW">中文</option>
+            <option value="ja">日文</option>
+        </select>
+        <button id="startBtn">開始收音</button>
+        <button id="stopBtn" disabled>停止</button>
+        <button id="clearBtn" type="button">清除文字</button>
+    </div>
+
+    <div class="display-area">
+        <div class="track" id="sourceTrack">
+            <div class="label">🗣️ 原音逐字稿</div>
+            <span id="finalOriginal" class="final-text"></span>
+            <span id="interimOriginal" class="interim-text"></span>
+        </div>
+        
+        <div class="track" id="targetTrack">
+            <div class="label">🌐 即時翻譯</div>
+            <span id="finalTranslation" class="final-text"></span>
+            <span id="interimTranslation" class="interim-text"></span>
+        </div>
+    </div>
+    <div id="status" class="status">準備就緒，請點擊「開始收音」</div>
+    <p class="status" style="margin-top:8px; font-size:12px; opacity:0.85;">💡 準確度提示：靠近麥克風、減少環境噪音、說話速度適中、咬字清楚</p>
+</div>
+
+<script>
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const statusText = document.getElementById('status');
+    
+    const finalOriginalSpan = document.getElementById('finalOriginal');
+    const interimOriginalSpan = document.getElementById('interimOriginal');
+    const finalTranslationSpan = document.getElementById('finalTranslation');
+    const interimTranslationSpan = document.getElementById('interimTranslation');
+
+    const sourceTrack = document.getElementById('sourceTrack');
+    const targetTrack = document.getElementById('targetTrack');
+
+    // 檢查瀏覽器支援度
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+        alert("您的瀏覽器不支援 Web Speech API，請使用最新版 Google Chrome。");
+    }
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true; 
+    recognition.interimResults = true; // 關鍵：開啟即時(未定案)辨識結果
+    recognition.maxAlternatives = 5;  // 取得多個候選，從中挑信心度最高的以減少錯字
+
+    let translateTimeout; // 用於控制即時翻譯的頻率
+    let isManualStop = false; // 判斷是否為使用者主動按停止
+
+    recognition.onstart = () => {
+        statusText.innerText = "🔴 正在同步聆聽與翻譯中...";
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+    };
+
+    // 從多個候選中選出信心度最高的，提高辨識準確度
+    function getBestTranscript(result) {
+        if (!result.length) return '';
+        let best = result[0];
+        let bestConf = best.confidence ?? 0;
+        for (let j = 1; j < result.length; j++) {
+            const c = result[j].confidence ?? 0;
+            if (c > bestConf) { best = result[j]; bestConf = c; }
+        }
+        return best.transcript;
+    }
+
+    recognition.onresult = (event) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const text = getBestTranscript(event.results[i]);
+            if (event.results[i].isFinal) {
+                finalTranscript += text;
+            } else {
+                interimTranscript += text;
+            }
+        }
+        
+        // 1. 即時更新「正在說」的原文（黃色字）
+        interimOriginalSpan.innerText = interimTranscript;
+        scrollToBottom();
+
+        // 2. 如果有一句完整的話說完了
+        if (finalTranscript) {
+            finalOriginalSpan.innerHTML += finalTranscript + '<br>';
+            interimOriginalSpan.innerText = ''; // 清空正在說的字
+            
+            // 翻譯定案的句子
+            translateText(finalTranscript, true);
+        }
+
+        // 3. 處理「正在說」的即時翻譯 (使用 debounce 避免每講一個字就戳一次 API 被封鎖)
+        if (interimTranscript) {
+            clearTimeout(translateTimeout);
+            translateTimeout = setTimeout(() => {
+                translateText(interimTranscript, false);
+            }, 600); // 延遲 0.6 秒後才翻譯未定案的半句話，達到即時又不過度消耗資源的平衡
+        } else {
+            interimTranslationSpan.innerText = '';
+        }
+    };
+
+    recognition.onerror = (event) => {
+        statusText.innerText = "發生錯誤: " + event.error;
+    };
+
+    recognition.onend = () => {
+        if (isManualStop) {
+            // 使用者真的按了「停止」，才結束整個循環
+            statusText.innerText = "收音已結束。";
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        } else {
+            // 非使用者主動停止：自動重啟收音，維持長時間連續
+            statusText.innerText = "連線維持中，已自動續接收音…";
+            recognition.start();
+        }
+    };
+
+    startBtn.onclick = () => {
+        isManualStop = false;
+        recognition.lang = document.getElementById('sourceLang').value;
+        recognition.start();
+    };
+
+    stopBtn.onclick = () => {
+        isManualStop = true;
+        recognition.stop();
+    };
+
+    clearBtn.onclick = () => {
+        clearTimeout(translateTimeout);
+        finalOriginalSpan.innerHTML = '';
+        interimOriginalSpan.innerText = '';
+        finalTranslationSpan.innerHTML = '';
+        interimTranslationSpan.innerText = '';
+
+        statusText.innerText = startBtn.disabled
+            ? "已清除文字（仍在收音中）"
+            : "已清除文字，可重新開始收音";
+        scrollToBottom();
+    };
+
+    // 呼叫翻譯 API
+    async function translateText(text, isFinal) {
+        if (!text.trim()) return;
+
+        const source = document.getElementById('sourceLang').value.split('-')[0];
+        const target = document.getElementById('targetLang').value;
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${source}&tl=${target}&dt=t&q=${encodeURI(text)}`;
+
+        try {
+            const response = await fetch(url);
+            const data = await response.json();
+            const translatedText = data[0].map(item => item[0]).join('');
+            
+            if (isFinal) {
+                // 如果是定案的句子，加入最終對話框並清空暫存翻譯
+                finalTranslationSpan.innerHTML += translatedText + '<br>';
+                interimTranslationSpan.innerText = '';
+            } else {
+                // 如果是講到一半的句子，顯示在暫存區（黃色字）
+                interimTranslationSpan.innerText = translatedText;
+            }
+            scrollToBottom();
+        } catch (error) {
+            console.error("翻譯請求失敗:", error);
+        }
+    }
+
+    function scrollToBottom() {
+        sourceTrack.scrollTop = sourceTrack.scrollHeight;
+        targetTrack.scrollTop = targetTrack.scrollHeight;
+    }
+</script>
+
+</body>
+</html>
